@@ -1,0 +1,38 @@
+{
+  "name": "tested-aws-simulators",
+  "version": "0.1.0",
+  "description": "Local, tested simulators for AWS S3, SES, Cognito and Transcribe (plus Sentry and OpenRouter) for development and end-to-end tests.",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "tested-aws-simulators": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "tsx src/cli.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.879.0",
+    "@aws-sdk/client-s3": "^3.879.0",
+    "@aws-sdk/client-ses": "^3.879.0",
+    "@aws-sdk/s3-request-presigner": "^3.879.0",
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.15.2",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  }
+}

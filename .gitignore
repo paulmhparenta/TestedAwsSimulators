@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.local-s3/
+.test-s3-*/
+*.log
