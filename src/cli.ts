@@ -4,6 +4,7 @@
  *
  *   npx tested-aws-simulators                 # all of them
  *   npx tested-aws-simulators s3 ses cognito  # only these
+ *   npx tested-aws-simulators sqs dynamodb    # the in-memory queue and table stores
  *
  * Ports come from the *_PORT env vars named in each simulator (for example
  * S3_SIMULATOR_PORT). The Cognito emulator starts with the users in the JSON
@@ -17,8 +18,10 @@ import { startSesSimulator } from './ses/ses-simulator';
 import { startCognitoEmulator, type CognitoSeedUser } from './cognito/cognito-emulator';
 import { startSentrySimulator } from './sentry/sentry-simulator';
 import { startOpenRouterSimulator } from './openrouter/openrouter-simulator';
+import { startSqsSimulator } from './sqs/sqs-simulator';
+import { startDynamoDbSimulator } from './dynamodb/dynamodb-simulator';
 
-const ALL = ['s3', 'ses', 'cognito', 'sentry', 'openrouter'] as const;
+const ALL = ['s3', 'ses', 'cognito', 'sentry', 'openrouter', 'sqs', 'dynamodb'] as const;
 type Name = (typeof ALL)[number];
 
 function readCognitoUsers(): CognitoSeedUser[] {
@@ -40,6 +43,8 @@ const starters: Record<Name, () => Promise<unknown>> = {
   }),
   sentry: () => startSentrySimulator(),
   openrouter: () => startOpenRouterSimulator(),
+  sqs: () => startSqsSimulator(),
+  dynamodb: () => startDynamoDbSimulator(),
 };
 
 async function main(): Promise<void> {

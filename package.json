@@ -1,7 +1,7 @@
 {
   "name": "tested-aws-simulators",
   "version": "0.1.0",
-  "description": "Local, tested simulators for AWS S3, SES, Cognito and Transcribe (plus Sentry and OpenRouter) for development and end-to-end tests.",
+  "description": "Local, tested simulators for AWS S3, SES, Cognito, Transcribe, SQS and DynamoDB (plus Sentry and OpenRouter) for development and end-to-end tests.",
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

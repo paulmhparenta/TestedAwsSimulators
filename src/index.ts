@@ -7,3 +7,5 @@ export * from './cognito/cognito-emulator';
 export * from './transcribe/transcription-simulator';
 export * from './sentry/sentry-simulator';
 export * from './openrouter/openrouter-simulator';
+export * from './sqs/sqs-simulator';
+export * from './dynamodb/dynamodb-simulator';
