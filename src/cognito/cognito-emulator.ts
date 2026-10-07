@@ -17,7 +17,7 @@
  *      RespondToAuthChallenge (NEW_PASSWORD_REQUIRED), ListUsers,
  *      AdminGetUser, AdminCreateUser, AdminUpdateUserAttributes,
  *      AdminSetUserPassword, AdminDeleteUser, AdminDisableUser,
- *      AdminEnableUser, AdminListGroupsForUser, AdminAddUserToGroup,
+ *      AdminEnableUser, AdminListGroupsForUser, ListUsersInGroup, AdminAddUserToGroup,
  *      AdminRemoveUserFromGroup, AdminUserGlobalSignOut, ForgotPassword,
  *      ConfirmForgotPassword, GetUser, AssociateSoftwareToken,
  *      VerifySoftwareToken, SetUserMFAPreference
@@ -371,6 +371,27 @@ function decodeListUsersToken(value: string): ListUsersToken | undefined {
     if (typeof parsed.offset !== 'number' || !Number.isInteger(parsed.offset) || parsed.offset < 0) return undefined;
     if (typeof parsed.filter !== 'string') return undefined;
     return { offset: parsed.offset, filter: parsed.filter };
+  } catch {
+    return undefined;
+  }
+}
+
+interface ListUsersInGroupToken {
+  readonly offset: number;
+  readonly group: string;
+}
+
+/** An opaque ListUsersInGroup NextToken: where the next page starts, and the group it continues. */
+function encodeListUsersInGroupToken(token: ListUsersInGroupToken): string {
+  return toBase64Url(JSON.stringify(token));
+}
+
+function decodeListUsersInGroupToken(value: string): ListUsersInGroupToken | undefined {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Partial<ListUsersInGroupToken>;
+    if (typeof parsed.offset !== 'number' || !Number.isInteger(parsed.offset) || parsed.offset < 0) return undefined;
+    if (typeof parsed.group !== 'string') return undefined;
+    return { offset: parsed.offset, group: parsed.group };
   } catch {
     return undefined;
   }
@@ -1461,6 +1482,47 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
       // AdminCreateUser name it `Attributes`.
       const { Attributes, ...rest } = toUserType(user);
       res.json({ ...rest, UserAttributes: Attributes });
+    },
+
+    /**
+     * The members of one group, a page at a time (Limit 0..60, 60 when absent
+     * or 0), as `UserType` objects. The emulator keeps no group objects, so a
+     * group nobody is in answers an empty list where Cognito answers
+     * ResourceNotFoundException for a group that does not exist. Group names
+     * compare without case, as AdminAddUserToGroup does here.
+     */
+    ListUsersInGroup(payload, _req, res) {
+      const groupName = String(payload.GroupName ?? '').trim();
+      if (!groupName) {
+        res.status(400).json({ __type: 'InvalidParameterException', message: 'GroupName is required.' });
+        return;
+      }
+      const limit = payload.Limit ?? LIST_USERS_MAX_LIMIT;
+      if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 0 || limit > LIST_USERS_MAX_LIMIT) {
+        res.status(400).json({
+          __type: 'InvalidParameterException',
+          message: `1 validation error detected: Value '${String(limit)}' at 'limit' failed to satisfy constraint: Member must have value less than or equal to ${LIST_USERS_MAX_LIMIT}`,
+        });
+        return;
+      }
+      const pageSize = limit === 0 ? LIST_USERS_MAX_LIMIT : limit;
+      let offset = 0;
+      if (payload.NextToken !== undefined) {
+        const token = decodeListUsersInGroupToken(String(payload.NextToken));
+        if (!token || token.group !== groupName.toLowerCase()) {
+          res.status(400).json({ __type: 'InvalidParameterException', message: 'Invalid pagination token.' });
+          return;
+        }
+        offset = token.offset;
+      }
+      const members = users.filter((user) => user.groups.some((g) => g.toLowerCase() === groupName.toLowerCase()));
+      const nextOffset = offset + pageSize;
+      res.json({
+        Users: members.slice(offset, nextOffset).map(toUserType),
+        ...(nextOffset < members.length
+          ? { NextToken: encodeListUsersInGroupToken({ offset: nextOffset, group: groupName.toLowerCase() }) }
+          : {}),
+      });
     },
 
     AdminListGroupsForUser(payload, _req, res) {

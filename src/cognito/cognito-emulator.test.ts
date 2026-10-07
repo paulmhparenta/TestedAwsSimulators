@@ -7,6 +7,7 @@ import {
   AdminEnableUserCommand,
   AdminGetUserCommand,
   AdminListGroupsForUserCommand,
+  ListUsersInGroupCommand,
   AdminSetUserPasswordCommand,
   AdminUpdateUserAttributesCommand,
   CognitoIdentityProviderClient,
@@ -433,6 +434,32 @@ describe('Cognito emulator through the AWS SDK', () => {
 
     await expect(sdk.send(new AdminGetUserCommand({ UserPoolId: 'local', Username: 'nobody' })))
       .rejects.toBeInstanceOf(UserNotFoundException);
+  });
+
+  it('ListUsersInGroup pages through the members of one group, without case in the group name', async () => {
+    const first = await sdk.send(new ListUsersInGroupCommand({ UserPoolId: 'local', GroupName: 'users', Limit: 4 }));
+    expect(first.Users?.map((u) => u.Username)).toEqual(['admin-001', 'user-001', 'mfa-001', 'nomfa-001']);
+    expect(first.Users?.[0]?.Attributes?.find((a) => a.Name === 'sub')?.Value).toBe('admin-001');
+    expect(first.NextToken).toBeTruthy();
+
+    const second = await sdk.send(new ListUsersInGroupCommand({ UserPoolId: 'local', GroupName: 'Users', Limit: 4, NextToken: first.NextToken }));
+    expect(second.Users?.map((u) => u.Username)).toEqual(['badcode-001', 'unverified-001']);
+    expect(second.NextToken).toBeUndefined();
+
+    const admins = await sdk.send(new ListUsersInGroupCommand({ UserPoolId: 'local', GroupName: 'Admin' }));
+    expect(admins.Users?.map((u) => u.Username)).toEqual(['admin-001']);
+    const nobody = await sdk.send(new ListUsersInGroupCommand({ UserPoolId: 'local', GroupName: 'nobody-group' }));
+    expect(nobody.Users).toEqual([]);
+  });
+
+  it('ListUsersInGroup refuses a token from another group and a Limit above 60', async () => {
+    const first = await sdk.send(new ListUsersInGroupCommand({ UserPoolId: 'local', GroupName: 'Users', Limit: 1 }));
+    await expect(sdk.send(new ListUsersInGroupCommand({ UserPoolId: 'local', GroupName: 'Admin', NextToken: first.NextToken })))
+      .rejects.toBeInstanceOf(InvalidParameterException);
+    await expect(sdk.send(new ListUsersInGroupCommand({ UserPoolId: 'local', GroupName: 'Users', NextToken: 'garbage' })))
+      .rejects.toBeInstanceOf(InvalidParameterException);
+    await expect(sdk.send(new ListUsersInGroupCommand({ UserPoolId: 'local', GroupName: 'Users', Limit: 61 })))
+      .rejects.toBeInstanceOf(InvalidParameterException);
   });
 
   it('AdminCreateUser returns FORCE_CHANGE_PASSWORD and stores custom attributes', async () => {

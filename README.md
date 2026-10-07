@@ -159,7 +159,8 @@ RespondToAuthChallenge (`NEW_PASSWORD_REQUIRED`), ListUsers (Filter, Limit,
 PaginationToken, AttributesToGet), AdminGetUser, AdminCreateUser
 (`MessageAction` `SUPPRESS` / `RESEND`, `DesiredDeliveryMediums`),
 AdminUpdateUserAttributes, AdminSetUserPassword, AdminDeleteUser,
-AdminDisableUser, AdminEnableUser, AdminListGroupsForUser, AdminAddUserToGroup,
+AdminDisableUser, AdminEnableUser, AdminListGroupsForUser, ListUsersInGroup (Limit,
+NextToken), AdminAddUserToGroup,
 AdminRemoveUserFromGroup, AdminUserGlobalSignOut, ForgotPassword,
 ConfirmForgotPassword, GetUser, AssociateSoftwareToken, VerifySoftwareToken,
 SetUserMFAPreference. Any other action answers `UnknownOperationException` with
