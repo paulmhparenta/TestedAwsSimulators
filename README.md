@@ -138,7 +138,10 @@ const cognito = await startCognitoEmulator({
   users: [
     { userId: 'admin-001', email: 'admin@example.com', name: 'Ada Admin', groups: ['Admin'], customAttributes: { tenantId: 'a' } },
     { userId: 'user-001', email: 'user@example.com', name: 'Uma User', groups: ['Users'], emailVerified: false },
+    { userId: 'gone-001', email: 'gone@example.com', name: 'Gil Gone', groups: ['Users'], enabled: false },
   ],
+  // Optional. Fields left out take Cognito's defaults (8, and all four classes required).
+  passwordPolicy: { minimumLength: 12, requireSymbols: false },
 });
 // cognito.jwksUrl → verify tokens exactly as you verify real Cognito tokens
 ```
@@ -152,26 +155,53 @@ Hosted UI: `GET /oauth2/authorize` shows a user picker. Each user button has a
 `/.well-known/jwks.json`.
 
 JSON API actions: InitiateAuth (`USER_PASSWORD_AUTH`, `REFRESH_TOKEN_AUTH`),
-ListUsers (with Filter and Limit), AdminGetUser, AdminCreateUser,
+RespondToAuthChallenge (`NEW_PASSWORD_REQUIRED`), ListUsers (Filter, Limit,
+PaginationToken, AttributesToGet), AdminGetUser, AdminCreateUser
+(`MessageAction` `SUPPRESS` / `RESEND`, `DesiredDeliveryMediums`),
 AdminUpdateUserAttributes, AdminSetUserPassword, AdminDeleteUser,
-AdminListGroupsForUser, AdminAddUserToGroup, AdminRemoveUserFromGroup,
-AdminUserGlobalSignOut, ForgotPassword, ConfirmForgotPassword, GetUser,
-AssociateSoftwareToken, VerifySoftwareToken, SetUserMFAPreference. Any other
-action answers `UnknownOperationException` with its name.
+AdminDisableUser, AdminEnableUser, AdminListGroupsForUser, AdminAddUserToGroup,
+AdminRemoveUserFromGroup, AdminUserGlobalSignOut, ForgotPassword,
+ConfirmForgotPassword, GetUser, AssociateSoftwareToken, VerifySoftwareToken,
+SetUserMFAPreference. Any other action answers `UnknownOperationException` with
+its name. Every Admin call takes the user's `sub` or email as `Username`, as on
+a pool that signs in by email.
 
 Behaviour copied from real Cognito, each with a test:
 
 - Custom attributes are on the ID token and ListUsers, never on the access token.
 - A ListUsers Filter on a custom attribute is refused; a valid Filter is applied.
 - AdminCreateUser stores only the attributes it was given: no invented name, and
-  status `FORCE_CHANGE_PASSWORD` until a permanent password is set.
-- The default password policy is enforced on every password write.
+  status `FORCE_CHANGE_PASSWORD` until a permanent password is set. With no
+  `TemporaryPassword` it generates one that meets the policy.
+- A `FORCE_CHANGE_PASSWORD` user who signs in gets the `NEW_PASSWORD_REQUIRED`
+  challenge and no tokens; RespondToAuthChallenge sets the password and
+  confirms the account. On the hosted UI, picking such a user shows a
+  new-password form (`data-testid="local-auth-new-password"`) before any code.
+- AdminSetUserPassword with `Permanent: true` confirms the account; without it
+  the account goes to `FORCE_CHANGE_PASSWORD`, even from `CONFIRMED`.
+- The pool's password policy (`passwordPolicy`, default Cognito's) is enforced
+  on every password write, refused as `InvalidPasswordException` "Password does
+  not conform to policy: …".
+- A disabled user reads `Enabled: false` on AdminGetUser and ListUsers, is
+  refused by InitiateAuth and the hosted UI with "User is disabled.", and loses
+  its refresh tokens and (for Cognito API calls) its access tokens.
+  AdminUserGlobalSignOut revokes the same tokens.
+- ListUsers filters on `status = "Enabled"` / `"Disabled"` and pages 60 users at a
+  time unless `Limit` says fewer; `Limit` above 60 is refused.
 - GetUser and the TOTP calls require the `aws.cognito.signin.user.admin` scope.
 - ForgotPassword and ConfirmForgotPassword give Cognito's own refusals, check the
   code before the password, and revoke refresh tokens on success.
 
+Invitations: AdminCreateUser without `SUPPRESS` records the invitation Cognito
+would send, temporary password included; read it with
+`GET /__local/invitation?email=` or `cognito.emulator.getInvitation(email)`.
+The emulator stores no phone number, so an invitation by SMS (the AWS default
+medium) is refused: send `DesiredDeliveryMediums: ['EMAIL']` or
+`MessageAction: 'SUPPRESS'`.
+
 Test hooks: `GET /__local/forgot-password-code?email=`,
-`POST /__local/expire-forgot-password-code?email=`, `GET /__local/mfa-state?email=`.
+`POST /__local/expire-forgot-password-code?email=`, `GET /__local/mfa-state?email=`,
+`GET /__local/invitation?email=`.
 TOTP: any six-digit code verifies except `000000`, which is refused.
 
 ### SQS
