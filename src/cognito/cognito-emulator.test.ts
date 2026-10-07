@@ -1,20 +1,33 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createHash, createPublicKey, verify as verifySignature, type JsonWebKey } from 'node:crypto';
 import {
+  AdminAddUserToGroupCommand,
   AdminCreateUserCommand,
+  AdminDisableUserCommand,
+  AdminEnableUserCommand,
   AdminGetUserCommand,
   AdminListGroupsForUserCommand,
+  AdminSetUserPasswordCommand,
+  AdminUpdateUserAttributesCommand,
   CognitoIdentityProviderClient,
+  GetUserCommand,
   InitiateAuthCommand,
+  InvalidParameterException,
+  InvalidPasswordException,
   ListUsersCommand,
   NotAuthorizedException,
+  RespondToAuthChallengeCommand,
+  UnsupportedUserStateException,
   UserNotFoundException,
 } from '@aws-sdk/client-cognito-identity-provider';
 
 import {
+  COGNITO_DEFAULT_PASSWORD_POLICY,
+  createCognitoEmulator,
   startCognitoEmulator,
   maskEmailDestination,
   validateCognitoDefaultPasswordPolicy,
+  validateCognitoPasswordPolicy,
   type CognitoEmulator,
   type CognitoSeedUser,
 } from './cognito-emulator';
@@ -380,10 +393,10 @@ describe('Cognito emulator: InitiateAuth', () => {
   });
 
   it('refuses an operation the emulator does not implement, by name', async () => {
-    const res = await callCognito('AdminDisableUser', { Username: 'user-001' });
+    const res = await callCognito('AdminResetUserPassword', { Username: 'user-001' });
     expect(res.status).toBe(400);
     expect(res.json.__type).toBe('UnknownOperationException');
-    expect(String(res.json.message)).toContain('AdminDisableUser');
+    expect(String(res.json.message)).toContain('AdminResetUserPassword');
   });
 });
 
@@ -530,7 +543,7 @@ describe('Cognito emulator: user administration', () => {
     expect(running.emulator.getUser('user-001')?.name).toBe('Uma Renamed');
   });
 
-  it.each(['AdminUpdateUserAttributes', 'AdminGetUser', 'AdminDeleteUser', 'AdminSetUserPassword', 'AdminListGroupsForUser', 'AdminUserGlobalSignOut'])(
+  it.each(['AdminUpdateUserAttributes', 'AdminGetUser', 'AdminDeleteUser', 'AdminSetUserPassword', 'AdminListGroupsForUser', 'AdminUserGlobalSignOut', 'AdminDisableUser', 'AdminEnableUser'])(
     '%s refuses an unknown user with UserNotFoundException',
     async (action) => {
       const res = await callCognito(action, { Username: 'no-such-user', Password: PASSWORD, UserAttributes: [] });
@@ -550,7 +563,7 @@ describe('Cognito emulator: user administration', () => {
     expect((await callCognito('AdminDeleteUser', { Username: email })).status).toBe(200);
     expect(running.emulator.getUser(email)).toBeNull();
 
-    const recreate = await callCognito('AdminCreateUser', { Username: email, UserAttributes: [{ Name: 'email', Value: email }] });
+    const recreate = await callCognito('AdminCreateUser', { Username: email, UserAttributes: [{ Name: 'email', Value: email }], MessageAction: 'SUPPRESS' });
     expect(recreate.status).toBe(200);
   });
 
@@ -854,5 +867,426 @@ describe('Cognito emulator helpers', () => {
 
   it('accepts a password that meets the default policy', () => {
     expect(validateCognitoDefaultPasswordPolicy('Password1!')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// User lifecycle: disable/enable, invitations, NEW_PASSWORD_REQUIRED
+// ---------------------------------------------------------------------------
+
+const POOL = 'local';
+
+/** A user created through the SDK with a known temporary password, still FORCE_CHANGE_PASSWORD. */
+async function createInvitedUser(temporaryPassword = 'Temporary1!'): Promise<{ email: string; sub: string }> {
+  const email = `invited-${Math.random().toString(36).slice(2, 8)}@example.com`;
+  const created = await sdk.send(new AdminCreateUserCommand({
+    UserPoolId: POOL,
+    Username: email,
+    UserAttributes: [{ Name: 'email', Value: email }, { Name: 'email_verified', Value: 'true' }],
+    TemporaryPassword: temporaryPassword,
+    MessageAction: 'SUPPRESS',
+  }));
+  return { email, sub: created.User!.Username! };
+}
+
+/** The authorize request parameters for the hosted UI, with the user already picked. */
+function authorizeParams(selectedUser: string): Record<string, string> {
+  return {
+    response_type: 'code',
+    client_id: CLIENT_ID,
+    redirect_uri: 'http://localhost:5173/auth/callback',
+    state: 'state-123',
+    code_challenge: createHash('sha256').update('a'.repeat(64)).digest('base64url'),
+    code_challenge_method: 'S256',
+    selected_user: selectedUser,
+    continue: '1',
+  };
+}
+
+describe('Cognito emulator: AdminDisableUser and AdminEnableUser', () => {
+  it('a disabled user reads Enabled: false and cannot sign in; enabling restores both', async () => {
+    await sdk.send(new AdminDisableUserCommand({ UserPoolId: POOL, Username: 'user-001' }));
+
+    expect((await sdk.send(new AdminGetUserCommand({ UserPoolId: POOL, Username: 'user-001' }))).Enabled).toBe(false);
+    const listed = await sdk.send(new ListUsersCommand({ UserPoolId: POOL, Filter: 'username = "user-001"' }));
+    expect(listed.Users?.[0]?.Enabled).toBe(false);
+    expect(running.emulator.getUser('user-001')?.enabled).toBe(false);
+
+    const refused = sdk.send(new InitiateAuthCommand({
+      AuthFlow: 'USER_PASSWORD_AUTH', ClientId: CLIENT_ID, AuthParameters: { USERNAME: 'user@example.com', PASSWORD },
+    }));
+    await expect(refused).rejects.toBeInstanceOf(NotAuthorizedException);
+    await expect(refused).rejects.toThrow('User is disabled.');
+
+    await sdk.send(new AdminEnableUserCommand({ UserPoolId: POOL, Username: 'user-001' }));
+    expect((await sdk.send(new AdminGetUserCommand({ UserPoolId: POOL, Username: 'user-001' }))).Enabled).toBe(true);
+    expect((await passwordLogin('user@example.com')).status).toBe(200);
+  });
+
+  it('a wrong password for a disabled user is still a wrong password', async () => {
+    await sdk.send(new AdminDisableUserCommand({ UserPoolId: POOL, Username: 'user-001' }));
+
+    const res = await passwordLogin('user@example.com', 'WrongPassword1!');
+    expect(res.json).toMatchObject({ __type: 'NotAuthorizedException', message: 'Incorrect username or password.' });
+  });
+
+  it('accepts the email as Username, as Cognito does for an email-username pool', async () => {
+    await sdk.send(new AdminDisableUserCommand({ UserPoolId: POOL, Username: 'user@example.com' }));
+    expect(running.emulator.getUser('user-001')?.enabled).toBe(false);
+
+    await sdk.send(new AdminEnableUserCommand({ UserPoolId: POOL, Username: 'user@example.com' }));
+    expect(running.emulator.getUser('user-001')?.enabled).toBe(true);
+  });
+
+  it('revokes the refresh token and the access token, and enabling does not bring them back', async () => {
+    const login = await passwordLogin('user@example.com');
+    await sdk.send(new AdminDisableUserCommand({ UserPoolId: POOL, Username: 'user-001' }));
+    await sdk.send(new AdminEnableUserCommand({ UserPoolId: POOL, Username: 'user-001' }));
+
+    const refreshed = await initiateAuth({ AuthFlow: 'REFRESH_TOKEN_AUTH', ClientId: CLIENT_ID, AuthParameters: { REFRESH_TOKEN: login.result!.RefreshToken } });
+    expect(refreshed.json.__type).toBe('NotAuthorizedException');
+
+    const getUser = sdk.send(new GetUserCommand({ AccessToken: login.result!.AccessToken }));
+    await expect(getUser).rejects.toBeInstanceOf(NotAuthorizedException);
+    await expect(getUser).rejects.toThrow('Access Token has been revoked');
+
+    // A token minted after re-enabling works.
+    expect((await callCognito('GetUser', { AccessToken: await accessTokenFor('user@example.com') })).status).toBe(200);
+  });
+
+  it('AdminUserGlobalSignOut revokes the access token for Cognito API calls too', async () => {
+    const accessToken = await accessTokenFor('user@example.com');
+    await callCognito('AdminUserGlobalSignOut', { Username: 'user-001' });
+
+    expect((await callCognito('GetUser', { AccessToken: accessToken })).json.message).toBe('Access Token has been revoked');
+  });
+
+  it('the hosted UI refuses a disabled user and issues no code', async () => {
+    await sdk.send(new AdminDisableUserCommand({ UserPoolId: POOL, Username: 'user-001' }));
+
+    const res = await fetch(`${baseUrl}/oauth2/authorize?${new URLSearchParams(authorizeParams('user-001'))}`, { redirect: 'manual' });
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain('User is disabled.');
+    expect(html).toContain('data-testid="local-auth-error"');
+  });
+
+  it('ListUsers filters on status = "Enabled" / "Disabled", case-sensitively', async () => {
+    await sdk.send(new AdminDisableUserCommand({ UserPoolId: POOL, Username: 'user-001' }));
+
+    const disabled = await sdk.send(new ListUsersCommand({ UserPoolId: POOL, Filter: 'status = "Disabled"' }));
+    expect(disabled.Users?.map((u) => u.Username)).toEqual(['user-001']);
+    const enabled = await sdk.send(new ListUsersCommand({ UserPoolId: POOL, Filter: 'status = "Enabled"' }));
+    expect(enabled.Users).toHaveLength(SEED_USERS.length - 1);
+    expect((await sdk.send(new ListUsersCommand({ UserPoolId: POOL, Filter: 'status = "disabled"' }))).Users).toHaveLength(0);
+  });
+
+  it('a seed user can start disabled', () => {
+    const emulator = createCognitoEmulator({ users: [{ userId: 'u', email: 'u@example.com', name: '', groups: [], enabled: false }] });
+    expect(emulator.getUser('u')?.enabled).toBe(false);
+  });
+});
+
+describe('Cognito emulator: AdminCreateUser invitations', () => {
+  const readInvitation = async (email: string) =>
+    ((await (await fetch(`${baseUrl}/__local/invitation?email=${encodeURIComponent(email)}`)).json()) as {
+      invitation: { temporaryPassword: string; deliveryMediums: string[] } | null;
+    }).invitation;
+
+  it('SUPPRESS sends no invitation and, with no TemporaryPassword, leaves no password anyone knows', async () => {
+    const created = await sdk.send(new AdminCreateUserCommand({
+      UserPoolId: POOL, Username: 'quiet@example.com', UserAttributes: [{ Name: 'email', Value: 'quiet@example.com' }], MessageAction: 'SUPPRESS',
+    }));
+
+    expect(created.User).toMatchObject({ UserStatus: 'FORCE_CHANGE_PASSWORD', Enabled: true });
+    expect(created.User?.UserCreateDate).toBeInstanceOf(Date);
+    expect(await readInvitation('quiet@example.com')).toBeNull();
+    expect(running.emulator.getInvitation('quiet@example.com')).toBeNull();
+    expect((await passwordLogin('quiet@example.com', PASSWORD)).json.__type).toBe('NotAuthorizedException');
+  });
+
+  it('DesiredDeliveryMediums EMAIL records the invitation with a generated temporary password that meets the policy', async () => {
+    await sdk.send(new AdminCreateUserCommand({
+      UserPoolId: POOL, Username: 'invitee2@example.com', UserAttributes: [{ Name: 'email', Value: 'invitee2@example.com' }], DesiredDeliveryMediums: ['EMAIL'],
+    }));
+
+    const invitation = await readInvitation('invitee2@example.com');
+    expect(invitation?.deliveryMediums).toEqual(['EMAIL']);
+    expect(validateCognitoDefaultPasswordPolicy(invitation!.temporaryPassword)).toBeNull();
+    expect(running.emulator.getInvitation('invitee2@example.com')?.temporaryPassword).toBe(invitation!.temporaryPassword);
+
+    // The temporary password works, and leads to the challenge.
+    const login = await passwordLogin('invitee2@example.com', invitation!.temporaryPassword);
+    expect(login.json.ChallengeName).toBe('NEW_PASSWORD_REQUIRED');
+  });
+
+  it('an invitation carries the TemporaryPassword the caller chose', async () => {
+    await callCognito('AdminCreateUser', {
+      Username: 'chosen@example.com', UserAttributes: [{ Name: 'email', Value: 'chosen@example.com' }], TemporaryPassword: 'Chosen123!', DesiredDeliveryMediums: ['EMAIL'],
+    });
+    expect((await readInvitation('chosen@example.com'))?.temporaryPassword).toBe('Chosen123!');
+  });
+
+  it.each([
+    ['the default SMS medium', {}],
+    ['an explicit SMS medium', { DesiredDeliveryMediums: ['SMS'] }],
+  ])('refuses %s, which the emulator cannot deliver without a phone number', async (_label, extra) => {
+    const res = await callCognito('AdminCreateUser', { Username: 'sms@example.com', UserAttributes: [{ Name: 'email', Value: 'sms@example.com' }], ...extra });
+    expect(res.json.__type).toBe('InvalidParameterException');
+    expect(String(res.json.message)).toContain('SMS');
+    expect(running.emulator.getUser('sms@example.com')).toBeNull();
+  });
+
+  it.each([
+    ['MessageAction', { MessageAction: 'SHOUT' }],
+    ['DesiredDeliveryMediums', { DesiredDeliveryMediums: ['PIGEON'] }],
+  ])('refuses an invalid %s', async (_label, extra) => {
+    const res = await callCognito('AdminCreateUser', { Username: 'bad@example.com', UserAttributes: [{ Name: 'email', Value: 'bad@example.com' }], ...extra });
+    expect(res.json.__type).toBe('InvalidParameterException');
+  });
+
+  it('RESEND issues a new temporary password and the old one stops working', async () => {
+    await callCognito('AdminCreateUser', {
+      Username: 'resend@example.com', UserAttributes: [{ Name: 'email', Value: 'resend@example.com' }], TemporaryPassword: 'FirstTemp1!', DesiredDeliveryMediums: ['EMAIL'],
+    });
+
+    const resent = await sdk.send(new AdminCreateUserCommand({ UserPoolId: POOL, Username: 'resend@example.com', MessageAction: 'RESEND', DesiredDeliveryMediums: ['EMAIL'] }));
+    expect(resent.User?.UserStatus).toBe('FORCE_CHANGE_PASSWORD');
+    expect(running.emulator.listUsers().filter((u) => u.email === 'resend@example.com')).toHaveLength(1);
+
+    const invitation = await readInvitation('resend@example.com');
+    expect(invitation?.temporaryPassword).not.toBe('FirstTemp1!');
+    expect((await passwordLogin('resend@example.com', 'FirstTemp1!')).json.__type).toBe('NotAuthorizedException');
+    expect((await passwordLogin('resend@example.com', invitation!.temporaryPassword)).json.ChallengeName).toBe('NEW_PASSWORD_REQUIRED');
+  });
+
+  it('RESEND refuses an unknown user and a user who has already set a password', async () => {
+    await expect(sdk.send(new AdminCreateUserCommand({ UserPoolId: POOL, Username: 'ghost@example.com', MessageAction: 'RESEND', DesiredDeliveryMediums: ['EMAIL'] })))
+      .rejects.toBeInstanceOf(UserNotFoundException);
+
+    const confirmed = sdk.send(new AdminCreateUserCommand({ UserPoolId: POOL, Username: 'user@example.com', MessageAction: 'RESEND', DesiredDeliveryMediums: ['EMAIL'] }));
+    await expect(confirmed).rejects.toBeInstanceOf(UnsupportedUserStateException);
+    await expect(confirmed).rejects.toThrow('status is not FORCE_CHANGE_PASSWORD');
+  });
+
+  it('UserLastModifiedDate moves on a change; UserCreateDate does not', async () => {
+    const { sub } = await createInvitedUser();
+    const before = await sdk.send(new AdminGetUserCommand({ UserPoolId: POOL, Username: sub }));
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+
+    await sdk.send(new AdminUpdateUserAttributesCommand({ UserPoolId: POOL, Username: sub, UserAttributes: [{ Name: 'given_name', Value: 'Later' }] }));
+    const after = await sdk.send(new AdminGetUserCommand({ UserPoolId: POOL, Username: sub }));
+
+    expect(after.UserCreateDate?.getTime()).toBe(before.UserCreateDate?.getTime());
+    expect(after.UserLastModifiedDate!.getTime()).toBeGreaterThan(before.UserLastModifiedDate!.getTime());
+  });
+
+  it('a user created by AdminCreateUser joins groups by email or sub, and the groups reach the token', async () => {
+    const { email, sub } = await createInvitedUser();
+    await sdk.send(new AdminAddUserToGroupCommand({ UserPoolId: POOL, Username: email, GroupName: 'Admin' }));
+    await sdk.send(new AdminAddUserToGroupCommand({ UserPoolId: POOL, Username: sub, GroupName: 'Users' }));
+
+    const groups = await sdk.send(new AdminListGroupsForUserCommand({ UserPoolId: POOL, Username: email }));
+    expect(groups.Groups?.map((g) => g.GroupName)).toEqual(['Admin', 'Users']);
+
+    await sdk.send(new AdminSetUserPasswordCommand({ UserPoolId: POOL, Username: email, Password: 'Permanent1!', Permanent: true }));
+    const id = decodePayload((await passwordLogin(email, 'Permanent1!')).result!.IdToken!);
+    expect(id['cognito:groups']).toEqual(['Admin', 'Users']);
+  });
+});
+
+describe('Cognito emulator: NEW_PASSWORD_REQUIRED', () => {
+  it('InitiateAuth for a FORCE_CHANGE_PASSWORD user returns the challenge and no tokens', async () => {
+    const { email, sub } = await createInvitedUser();
+
+    const auth = await sdk.send(new InitiateAuthCommand({ AuthFlow: 'USER_PASSWORD_AUTH', ClientId: CLIENT_ID, AuthParameters: { USERNAME: email, PASSWORD: 'Temporary1!' } }));
+    expect(auth.AuthenticationResult).toBeUndefined();
+    expect(auth.ChallengeName).toBe('NEW_PASSWORD_REQUIRED');
+    expect(auth.Session).toBeTruthy();
+    expect(auth.ChallengeParameters?.USER_ID_FOR_SRP).toBe(sub);
+    expect(JSON.parse(auth.ChallengeParameters!.userAttributes!)).toMatchObject({ email, email_verified: 'true' });
+    expect(auth.ChallengeParameters?.requiredAttributes).toBe('[]');
+  });
+
+  it('RespondToAuthChallenge enforces the policy, then confirms the user and issues tokens', async () => {
+    const { email, sub } = await createInvitedUser();
+    const auth = await sdk.send(new InitiateAuthCommand({ AuthFlow: 'USER_PASSWORD_AUTH', ClientId: CLIENT_ID, AuthParameters: { USERNAME: email, PASSWORD: 'Temporary1!' } }));
+
+    const weak = sdk.send(new RespondToAuthChallengeCommand({
+      ClientId: CLIENT_ID, ChallengeName: 'NEW_PASSWORD_REQUIRED', Session: auth.Session, ChallengeResponses: { USERNAME: email, NEW_PASSWORD: 'short' },
+    }));
+    await expect(weak).rejects.toBeInstanceOf(InvalidPasswordException);
+
+    const done = await sdk.send(new RespondToAuthChallengeCommand({
+      ClientId: CLIENT_ID,
+      ChallengeName: 'NEW_PASSWORD_REQUIRED',
+      Session: auth.Session,
+      ChallengeResponses: { USERNAME: email, NEW_PASSWORD: 'Chosen123!', 'userAttributes.given_name': 'Ivy' },
+    }));
+    expect(done.AuthenticationResult?.AccessToken).toBeTruthy();
+    expect(decodePayload(done.AuthenticationResult!.IdToken!).sub).toBe(sub);
+
+    const got = await sdk.send(new AdminGetUserCommand({ UserPoolId: POOL, Username: sub }));
+    expect(got.UserStatus).toBe('CONFIRMED');
+    expect(attrsOf(got.UserAttributes).given_name).toBe('Ivy');
+    expect((await passwordLogin(email, 'Chosen123!')).result?.AccessToken).toBeTruthy();
+  });
+
+  it('a challenge session is single use', async () => {
+    const { email } = await createInvitedUser();
+    const auth = await sdk.send(new InitiateAuthCommand({ AuthFlow: 'USER_PASSWORD_AUTH', ClientId: CLIENT_ID, AuthParameters: { USERNAME: email, PASSWORD: 'Temporary1!' } }));
+    const respond = () => sdk.send(new RespondToAuthChallengeCommand({
+      ClientId: CLIENT_ID, ChallengeName: 'NEW_PASSWORD_REQUIRED', Session: auth.Session, ChallengeResponses: { USERNAME: email, NEW_PASSWORD: 'Chosen123!' },
+    }));
+
+    await respond();
+    await expect(respond()).rejects.toBeInstanceOf(NotAuthorizedException);
+  });
+
+  it('refuses an unknown session, a wrong client, and a challenge the emulator does not model', async () => {
+    const bogus = sdk.send(new RespondToAuthChallengeCommand({
+      ClientId: CLIENT_ID, ChallengeName: 'NEW_PASSWORD_REQUIRED', Session: 'bogus', ChallengeResponses: { USERNAME: 'user@example.com', NEW_PASSWORD: 'Chosen123!' },
+    }));
+    await expect(bogus).rejects.toBeInstanceOf(NotAuthorizedException);
+    await expect(bogus).rejects.toThrow('Invalid session for the user.');
+
+    expect((await callCognito('RespondToAuthChallenge', { ClientId: 'wrong', ChallengeName: 'NEW_PASSWORD_REQUIRED', Session: 'x', ChallengeResponses: {} })).json.__type)
+      .toBe('NotAuthorizedException');
+    expect((await callCognito('RespondToAuthChallenge', { ClientId: CLIENT_ID, ChallengeName: 'SMS_MFA', Session: 'x', ChallengeResponses: {} })).json.__type)
+      .toBe('InvalidParameterException');
+  });
+
+  it('refuses a userAttributes.* the emulator does not store', async () => {
+    const { email } = await createInvitedUser();
+    const auth = await passwordLogin(email, 'Temporary1!');
+
+    const res = await callCognito('RespondToAuthChallenge', {
+      ClientId: CLIENT_ID,
+      ChallengeName: 'NEW_PASSWORD_REQUIRED',
+      Session: auth.json.Session,
+      ChallengeResponses: { USERNAME: email, NEW_PASSWORD: 'Chosen123!', 'userAttributes.phone_number': '+447700900000' },
+    });
+    expect(res.json.__type).toBe('InvalidParameterException');
+    expect(String(res.json.message)).toContain('phone_number');
+  });
+
+  it('the hosted UI asks a FORCE_CHANGE_PASSWORD user for a new password before issuing a code', async () => {
+    const { email, sub } = await createInvitedUser();
+
+    const picked = await fetch(`${baseUrl}/oauth2/authorize?${new URLSearchParams(authorizeParams(sub))}`, { redirect: 'manual' });
+    expect(picked.status).toBe(200);
+    const page = await picked.text();
+    expect(page).toContain('data-testid="local-auth-new-password"');
+    expect(page).toContain('method="post"');
+
+    const post = (newPassword: string) => fetch(`${baseUrl}/oauth2/authorize`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ ...authorizeParams(sub), new_password: newPassword }),
+    });
+
+    const weak = await post('short');
+    expect(weak.status).toBe(400);
+    expect(await weak.text()).toContain('Password does not conform to policy: Password not long enough');
+    expect(running.emulator.getUser(email)?.forceChangePassword).toBe(true);
+
+    const accepted = await post('Chosen123!');
+    expect(accepted.status).toBe(302);
+    const location = new URL(accepted.headers.get('location')!);
+    expect(location.searchParams.get('code')).toBeTruthy();
+    expect(running.emulator.getUser(email)?.forceChangePassword).toBe(false);
+    expect((await passwordLogin(email, 'Chosen123!')).status).toBe(200);
+  });
+});
+
+describe('Cognito emulator: AdminSetUserPassword and the password policy', () => {
+  it('a temporary password puts a CONFIRMED user back into FORCE_CHANGE_PASSWORD', async () => {
+    await sdk.send(new AdminSetUserPasswordCommand({ UserPoolId: POOL, Username: 'user@example.com', Password: 'Temporary1!', Permanent: false }));
+
+    expect((await sdk.send(new AdminGetUserCommand({ UserPoolId: POOL, Username: 'user-001' }))).UserStatus).toBe('FORCE_CHANGE_PASSWORD');
+    expect((await passwordLogin('user@example.com', 'Temporary1!')).json.ChallengeName).toBe('NEW_PASSWORD_REQUIRED');
+  });
+
+  it('omitting Permanent sets a temporary password, as Permanent defaults to false', async () => {
+    await callCognito('AdminSetUserPassword', { Username: 'user-001', Password: 'Temporary1!' });
+    expect(running.emulator.getUser('user-001')?.forceChangePassword).toBe(true);
+  });
+
+  it('refuses with Cognito\'s own wording', async () => {
+    const res = sdk.send(new AdminSetUserPasswordCommand({ UserPoolId: POOL, Username: 'user-001', Password: 'Sh0rt!', Permanent: true }));
+    await expect(res).rejects.toBeInstanceOf(InvalidPasswordException);
+    await expect(res).rejects.toThrow('Password does not conform to policy: Password not long enough');
+  });
+
+  it('enforces the policy the emulator was started with', async () => {
+    const custom = await startCognitoEmulator({
+      port: 0,
+      host: '127.0.0.1',
+      clientId: CLIENT_ID,
+      users: SEED_USERS,
+      passwordPolicy: { minimumLength: 12, requireSymbols: false },
+    });
+    const client = new CognitoIdentityProviderClient({ endpoint: custom.url, region: 'us-east-1', credentials: { accessKeyId: 'test', secretAccessKey: 'test' } });
+    try {
+      await expect(client.send(new AdminSetUserPasswordCommand({ UserPoolId: POOL, Username: 'user-001', Password: 'Password1!', Permanent: true })))
+        .rejects.toThrow('Password not long enough');
+      await client.send(new AdminSetUserPasswordCommand({ UserPoolId: POOL, Username: 'user-001', Password: 'Password1abc', Permanent: true }));
+      expect(custom.emulator.getUser('user-001')?.forceChangePassword).toBe(false);
+    } finally {
+      client.destroy();
+      await custom.close();
+    }
+  });
+
+  it('refuses a policy Cognito itself would not accept', () => {
+    expect(() => createCognitoEmulator({ passwordPolicy: { minimumLength: 5 } })).toThrow(/minimumLength/);
+    expect(() => createCognitoEmulator({ passwordPolicy: { minimumLength: 100 } })).toThrow(/minimumLength/);
+  });
+
+  it('validateCognitoPasswordPolicy names the first broken rule', () => {
+    expect(COGNITO_DEFAULT_PASSWORD_POLICY).toEqual({ minimumLength: 8, requireLowercase: true, requireUppercase: true, requireNumbers: true, requireSymbols: true });
+    expect(validateCognitoPasswordPolicy('abc', { minimumLength: 6 })).toBe('Password not long enough');
+    expect(validateCognitoPasswordPolicy('abcdefgh', { requireUppercase: false, requireNumbers: false, requireSymbols: false })).toBeNull();
+    expect(validateCognitoPasswordPolicy('abcdefgh', {})).toBe('Password must have uppercase characters');
+  });
+});
+
+describe('Cognito emulator: ListUsers pagination and AttributesToGet', () => {
+  it('pages through the pool with Limit and PaginationToken, with no duplicates', async () => {
+    const seen: string[] = [];
+    let token: string | undefined;
+    let pages = 0;
+    do {
+      const page = await sdk.send(new ListUsersCommand({ UserPoolId: POOL, Limit: 4, PaginationToken: token }));
+      seen.push(...(page.Users ?? []).map((u) => u.Username!));
+      token = page.PaginationToken;
+      pages += 1;
+    } while (token);
+
+    expect(pages).toBe(2);
+    expect(seen).toEqual(SEED_USERS.map((u) => u.userId));
+  });
+
+  it('returns no PaginationToken when the page holds everything', async () => {
+    const page = await sdk.send(new ListUsersCommand({ UserPoolId: POOL }));
+    expect(page.PaginationToken).toBeUndefined();
+  });
+
+  it('refuses a Limit above 60 and a PaginationToken it did not issue', async () => {
+    await expect(sdk.send(new ListUsersCommand({ UserPoolId: POOL, Limit: 61 }))).rejects.toBeInstanceOf(InvalidParameterException);
+    await expect(sdk.send(new ListUsersCommand({ UserPoolId: POOL, PaginationToken: 'bogus' }))).rejects.toBeInstanceOf(InvalidParameterException);
+  });
+
+  it('a PaginationToken only continues the query it came from', async () => {
+    const page = await sdk.send(new ListUsersCommand({ UserPoolId: POOL, Limit: 1 }));
+    expect(page.PaginationToken).toBeTruthy();
+    await expect(sdk.send(new ListUsersCommand({ UserPoolId: POOL, Limit: 1, Filter: 'email ^= "u"', PaginationToken: page.PaginationToken })))
+      .rejects.toBeInstanceOf(InvalidParameterException);
+  });
+
+  it('AttributesToGet returns only the named attributes', async () => {
+    const res = await sdk.send(new ListUsersCommand({ UserPoolId: POOL, AttributesToGet: ['email'], Filter: 'username = "admin-001"' }));
+    expect(res.Users?.[0]?.Attributes).toEqual([{ Name: 'email', Value: 'admin@example.com' }]);
   });
 });

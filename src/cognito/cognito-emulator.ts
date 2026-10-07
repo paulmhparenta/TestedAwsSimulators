@@ -13,11 +13,13 @@
  * 2. The Cognito Identity Provider JSON API (`x-amz-target:
  *    AWSCognitoIdentityProviderService.<Action>`) that
  *    `@aws-sdk/client-cognito-identity-provider` sends:
- *      InitiateAuth (USER_PASSWORD_AUTH, REFRESH_TOKEN_AUTH), ListUsers,
+ *      InitiateAuth (USER_PASSWORD_AUTH, REFRESH_TOKEN_AUTH),
+ *      RespondToAuthChallenge (NEW_PASSWORD_REQUIRED), ListUsers,
  *      AdminGetUser, AdminCreateUser, AdminUpdateUserAttributes,
- *      AdminSetUserPassword, AdminDeleteUser, AdminListGroupsForUser,
- *      AdminAddUserToGroup, AdminRemoveUserFromGroup, AdminUserGlobalSignOut,
- *      ForgotPassword, ConfirmForgotPassword, GetUser, AssociateSoftwareToken,
+ *      AdminSetUserPassword, AdminDeleteUser, AdminDisableUser,
+ *      AdminEnableUser, AdminListGroupsForUser, AdminAddUserToGroup,
+ *      AdminRemoveUserFromGroup, AdminUserGlobalSignOut, ForgotPassword,
+ *      ConfirmForgotPassword, GetUser, AssociateSoftwareToken,
  *      VerifySoftwareToken, SetUserMFAPreference
  *
  * Tokens are RS256 JWTs signed with a key generated at start-up, so a verifier
@@ -33,6 +35,7 @@
  *   GET  /__local/forgot-password-code?email=…       – the code ForgotPassword issued
  *   POST /__local/expire-forgot-password-code?email=… – move that code's expiry into the past
  *   GET  /__local/mfa-state?email=…                   – { enabled } for software-token MFA
+ *   GET  /__local/invitation?email=…                  – the invitation AdminCreateUser sent, or null
  *   POST /__local/reset                               – reset to the seed users, drop all codes and tokens
  */
 
@@ -89,11 +92,45 @@ export interface CognitoSeedUser {
    * AdminCreateUser that has never set its own password. Default false.
    */
   readonly forceChangePassword?: boolean;
+  /** Cognito `Enabled`. A disabled user cannot sign in. Default true. */
+  readonly enabled?: boolean;
   /**
    * Custom attributes WITHOUT the `custom:` prefix, e.g. `{ tenantId: 'a' }`.
    * They appear as `custom:tenantId` on the ID token, ListUsers and AdminGetUser.
    */
   readonly customAttributes?: Readonly<Record<string, string>>;
+}
+
+/**
+ * The user pool password policy, as `Policies.PasswordPolicy` on a real pool.
+ * Every field is optional; an absent field takes the Cognito default from
+ * `COGNITO_DEFAULT_PASSWORD_POLICY`.
+ */
+export interface CognitoPasswordPolicy {
+  /** 6 to 99, as Cognito allows. Default 8. */
+  readonly minimumLength?: number;
+  readonly requireLowercase?: boolean;
+  readonly requireUppercase?: boolean;
+  readonly requireNumbers?: boolean;
+  readonly requireSymbols?: boolean;
+}
+
+/** The policy a new Cognito user pool gets when it names none. */
+export const COGNITO_DEFAULT_PASSWORD_POLICY: Required<CognitoPasswordPolicy> = Object.freeze({
+  minimumLength: 8,
+  requireLowercase: true,
+  requireUppercase: true,
+  requireNumbers: true,
+  requireSymbols: true,
+});
+
+/** The invitation AdminCreateUser sent, which real Cognito would email. */
+export interface CognitoInvitation {
+  readonly userId: string;
+  readonly email: string;
+  readonly temporaryPassword: string;
+  readonly deliveryMediums: readonly string[];
+  readonly sentAt: string;
 }
 
 export interface CognitoEmulatorOptions {
@@ -114,6 +151,13 @@ export interface CognitoEmulatorOptions {
   readonly defaultScope?: string;
   /** Groups an account created by AdminCreateUser starts in. Default none, as in Cognito. */
   readonly newUserGroups?: readonly string[];
+  /**
+   * The pool's password policy, enforced on every password write
+   * (AdminCreateUser TemporaryPassword, AdminSetUserPassword,
+   * ConfirmForgotPassword, NEW_PASSWORD_REQUIRED). Default
+   * `COGNITO_DEFAULT_PASSWORD_POLICY`.
+   */
+  readonly passwordPolicy?: CognitoPasswordPolicy;
 }
 
 /** A user as the emulator holds it. */
@@ -124,9 +168,11 @@ export interface CognitoUserRecord {
   readonly groups: readonly string[];
   readonly emailVerified: boolean;
   readonly forceChangePassword: boolean;
+  readonly enabled: boolean;
   readonly customAttributes: Readonly<Record<string, string>>;
   readonly softwareTokenMfaEnabled: boolean;
   readonly createdAt: string;
+  readonly lastModifiedAt: string;
 }
 
 export interface CognitoEmulator {
@@ -135,7 +181,9 @@ export interface CognitoEmulator {
   /** The current users, in creation order. */
   listUsers(): readonly CognitoUserRecord[];
   getUser(userIdOrEmail: string): CognitoUserRecord | null;
-  /** Resets to the seed users and drops every code and refresh token. */
+  /** The last invitation AdminCreateUser sent the user, or null (none, or SUPPRESS). */
+  getInvitation(userIdOrEmail: string): CognitoInvitation | null;
+  /** Resets to the seed users and drops every code, session, invitation and refresh token. */
   reset(): void;
 }
 
@@ -147,10 +195,12 @@ interface MutableUser {
   password: string;
   emailVerified: boolean;
   forceChangePassword: boolean;
+  enabled: boolean;
   customAttributes: Record<string, string>;
   softwareTokenSecret?: string;
   softwareTokenMfaEnabled: boolean;
   createdAt: string;
+  lastModifiedAt: string;
 }
 
 /** The access-token claims this emulator reads back from a token it minted. */
@@ -158,6 +208,14 @@ interface AccessTokenClaims {
   readonly sub?: string;
   readonly token_use?: string;
   readonly scope?: string;
+  readonly origin_jti?: string;
+}
+
+/** A NEW_PASSWORD_REQUIRED challenge InitiateAuth issued, keyed by its `Session`. */
+interface NewPasswordChallengeRecord {
+  readonly userId: string;
+  readonly issuer: string;
+  readonly expiresAtMs: number;
 }
 
 interface AuthorizationCodeRecord {
@@ -191,6 +249,11 @@ type CognitoAttribute = { Name: string; Value: string };
 
 const AUTHORIZATION_CODE_TTL_MS = 5 * 60 * 1000;
 const FORGOT_PASSWORD_CODE_TTL_MS = 60 * 60 * 1000;
+/** Cognito's default `AuthSessionValidity`: a challenge must be answered within 3 minutes. */
+const CHALLENGE_SESSION_TTL_MS = 3 * 60 * 1000;
+/** ListUsers `Limit` range is 0..60, and 60 is also the page size when no Limit is sent. */
+const LIST_USERS_MAX_LIMIT = 60;
+const DELIVERY_MEDIUMS = new Set(['EMAIL', 'SMS']);
 
 /**
  * Attributes real Cognito allows in a `ListUsers` Filter expression. Custom
@@ -238,17 +301,49 @@ export function maskEmailDestination(email: string): string {
   return `${email.slice(0, 1)}***@${maskedDomain}`;
 }
 
+/** The characters Cognito counts as symbols in a password policy. */
+const COGNITO_PASSWORD_SYMBOL = /[\^$*.[\]{}()?\-"!@#%&/\\,><':;|_~`+=]/;
+
+/**
+ * The first rule of `policy` that `password` breaks, as the text Cognito puts
+ * after "Password does not conform to policy: ", or null. Fields `policy`
+ * leaves out take their `COGNITO_DEFAULT_PASSWORD_POLICY` value.
+ */
+export function validateCognitoPasswordPolicy(password: string, policy: CognitoPasswordPolicy = {}): string | null {
+  const effective = { ...COGNITO_DEFAULT_PASSWORD_POLICY, ...policy };
+  if (password.length < effective.minimumLength) return 'Password not long enough';
+  if (password.length > 256) return 'Password must have length less than or equal to 256';
+  if (effective.requireUppercase && !/[A-Z]/.test(password)) return 'Password must have uppercase characters';
+  if (effective.requireLowercase && !/[a-z]/.test(password)) return 'Password must have lowercase characters';
+  if (effective.requireNumbers && !/[0-9]/.test(password)) return 'Password must have numeric characters';
+  if (effective.requireSymbols && !COGNITO_PASSWORD_SYMBOL.test(password)) return 'Password must have symbol characters';
+  return null;
+}
+
 /** The first rule of Cognito's default password policy that `password` breaks, or null. */
 export function validateCognitoDefaultPasswordPolicy(password: string): string | null {
-  if (password.length < 8) return 'Password must have length greater than or equal to 8';
-  if (password.length > 256) return 'Password must have length less than or equal to 256';
-  if (!/[A-Z]/.test(password)) return 'Password must have uppercase characters';
-  if (!/[a-z]/.test(password)) return 'Password must have lowercase characters';
-  if (!/[0-9]/.test(password)) return 'Password must have numeric characters';
-  if (!/[\^$*.[\]{}()?\-"!@#%&/\\,><':;|_~`+=]/.test(password)) {
-    return 'Password must have symbol characters';
+  return validateCognitoPasswordPolicy(password, COGNITO_DEFAULT_PASSWORD_POLICY);
+}
+
+/** A policy Cognito would accept on CreateUserPool, with its defaults filled in; throws otherwise. */
+function resolvePasswordPolicy(policy: CognitoPasswordPolicy | undefined): Required<CognitoPasswordPolicy> {
+  const effective = { ...COGNITO_DEFAULT_PASSWORD_POLICY, ...(policy ?? {}) };
+  const { minimumLength } = effective;
+  if (!Number.isInteger(minimumLength) || minimumLength < 6 || minimumLength > 99) {
+    throw new Error(`passwordPolicy.minimumLength must be an integer from 6 to 99, as Cognito allows; got ${minimumLength}.`);
   }
-  return null;
+  return effective;
+}
+
+/**
+ * A temporary password that meets `policy`, as Cognito generates when
+ * AdminCreateUser is sent no TemporaryPassword. Always holds one character of
+ * every class, so it passes whichever rules are on.
+ */
+function generateTemporaryPassword(policy: Required<CognitoPasswordPolicy>): string {
+  const filler = randomBytes(96).toString('base64').replace(/[^A-Za-z0-9]/g, '');
+  const body = `Tq7!${filler}`;
+  return body.slice(0, Math.max(policy.minimumLength, 12));
 }
 
 function isValidEmailFormat(value: string): boolean {
@@ -258,6 +353,27 @@ function isValidEmailFormat(value: string): boolean {
 function toEpochSeconds(isoTimestamp: string): number {
   const epochMs = Date.parse(isoTimestamp);
   return Number.isFinite(epochMs) ? Math.floor(epochMs / 1000) : 0;
+}
+
+interface ListUsersToken {
+  readonly offset: number;
+  readonly filter: string;
+}
+
+/** An opaque ListUsers PaginationToken: where the next page starts, and the Filter it continues. */
+function encodeListUsersToken(token: ListUsersToken): string {
+  return toBase64Url(JSON.stringify(token));
+}
+
+function decodeListUsersToken(value: string): ListUsersToken | undefined {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Partial<ListUsersToken>;
+    if (typeof parsed.offset !== 'number' || !Number.isInteger(parsed.offset) || parsed.offset < 0) return undefined;
+    if (typeof parsed.filter !== 'string') return undefined;
+    return { offset: parsed.offset, filter: parsed.filter };
+  } catch {
+    return undefined;
+  }
 }
 
 function parseAwsJsonBody(rawBody: unknown): Record<string, unknown> {
@@ -321,13 +437,31 @@ function toRecord(user: MutableUser): CognitoUserRecord {
     groups: [...user.groups],
     emailVerified: user.emailVerified,
     forceChangePassword: user.forceChangePassword,
+    enabled: user.enabled,
     customAttributes: { ...user.customAttributes },
     softwareTokenMfaEnabled: user.softwareTokenMfaEnabled,
     createdAt: user.createdAt,
+    lastModifiedAt: user.lastModifiedAt,
+  };
+}
+
+/**
+ * The Cognito `UserType` ListUsers and AdminCreateUser return. AdminGetUser
+ * returns the same fields with the attributes under `UserAttributes`.
+ */
+function toUserType(user: MutableUser) {
+  return {
+    Username: user.userId,
+    Attributes: toCognitoUserAttributes(user),
+    Enabled: user.enabled,
+    UserStatus: userStatus(user),
+    UserCreateDate: toEpochSeconds(user.createdAt),
+    UserLastModifiedDate: toEpochSeconds(user.lastModifiedAt),
   };
 }
 
 function fromSeed(seed: CognitoSeedUser): MutableUser {
+  const seededAt = new Date(0).toISOString();
   return {
     userId: seed.userId,
     email: seed.email,
@@ -336,10 +470,17 @@ function fromSeed(seed: CognitoSeedUser): MutableUser {
     password: seed.password ?? COGNITO_EMULATOR_DEFAULT_PASSWORD,
     emailVerified: seed.emailVerified ?? true,
     forceChangePassword: seed.forceChangePassword ?? false,
+    enabled: seed.enabled ?? true,
     customAttributes: { ...(seed.customAttributes ?? {}) },
     softwareTokenMfaEnabled: false,
-    createdAt: new Date(0).toISOString(),
+    createdAt: seededAt,
+    lastModifiedAt: seededAt,
   };
+}
+
+/** Records a change to the user, so UserLastModifiedDate moves as it does in Cognito. */
+function touch(user: MutableUser): void {
+  user.lastModifiedAt = new Date().toISOString();
 }
 
 /**
@@ -380,11 +521,29 @@ function renderAuthorizePage(params: Record<string, string>, users: readonly Mut
       }
       return `<button type="submit" name="selected_user" value="${escapeHtml(user.userId)}" data-testid="${escapeHtml(testId)}">
             <span class="btn-name">${escapeHtml(user.name || user.email)}</span>
-            <span class="btn-meta">${escapeHtml(user.email)} &middot; ${escapeHtml(user.groups.join(', '))}</span>
+            <span class="btn-meta">${escapeHtml(user.email)} &middot; ${escapeHtml(user.groups.join(', '))}${user.enabled ? '' : ' &middot; disabled'}</span>
           </button>`;
     })
     .join('\n          ');
 
+  return renderHostedUiPage(`
+      <p>This is where the Cognito Hosted UI login would happen.</p>
+      <p>Select a user to sign in as:</p>
+      <div class="meta">
+        <div><strong>Client:</strong> ${escapeHtml(params.client_id ?? '')}</div>
+        <div><strong>Redirect:</strong> ${escapeHtml(params.redirect_uri ?? '')}</div>
+      </div>
+      <form method="get" action="/oauth2/authorize">
+        ${hidden}
+        <input type="hidden" name="continue" value="1" />
+        <div class="actions">
+          ${userButtons || '<p><em>No users are configured.</em></p>'}
+        </div>
+      </form>`);
+}
+
+/** The hosted-UI page chrome every sign-in page shares. */
+function renderHostedUiPage(content: string): string {
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -398,6 +557,8 @@ function renderAuthorizePage(params: Record<string, string>, users: readonly Mut
       p { margin: 0.5rem 0; line-height: 1.45; }
       .meta { margin-top: 1rem; padding: 0.75rem; background: #f1f5f9; border-radius: 8px; font-size: 0.9rem; }
       .actions { display: flex; flex-direction: column; gap: 0.75rem; margin-top: 1.25rem; }
+      .error { margin-top: 1rem; padding: 0.75rem; background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; color: #991b1b; }
+      input[type=password] { padding: 0.6rem; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 0.95rem; }
       button { appearance: none; border: 1px solid #cbd5e1; border-radius: 8px; padding: 0.75rem 1rem; background: #fff; color: #0f172a; font-size: 0.95rem; cursor: pointer; text-align: left; display: flex; flex-direction: column; gap: 0.2rem; }
       button:hover { background: #f1f5f9; border-color: #2563eb; }
       .btn-name { font-weight: 600; }
@@ -406,23 +567,36 @@ function renderAuthorizePage(params: Record<string, string>, users: readonly Mut
   </head>
   <body>
     <main class="container">
-      <h1>Local OAuth Simulator</h1>
-      <p>This is where the Cognito Hosted UI login would happen.</p>
-      <p>Select a user to sign in as:</p>
-      <div class="meta">
-        <div><strong>Client:</strong> ${escapeHtml(params.client_id ?? '')}</div>
-        <div><strong>Redirect:</strong> ${escapeHtml(params.redirect_uri ?? '')}</div>
-      </div>
-      <form method="get" action="/oauth2/authorize">
-        ${hidden}
-        <input type="hidden" name="continue" value="1" />
-        <div class="actions">
-          ${userButtons || '<p><em>No users are configured.</em></p>'}
-        </div>
-      </form>
+      <h1>Local OAuth Simulator</h1>${content}
     </main>
   </body>
 </html>`;
+}
+
+function renderSignInError(message: string): string {
+  return `
+      <div class="error" data-testid="local-auth-error">${escapeHtml(message)}</div>`;
+}
+
+/**
+ * The page the hosted UI shows a FORCE_CHANGE_PASSWORD user after sign-in:
+ * choose a new password before any code is issued. It posts back to
+ * /oauth2/authorize with every authorize parameter plus `new_password`.
+ */
+function renderNewPasswordPage(params: Record<string, string>, user: MutableUser, error?: string): string {
+  const hidden = Object.entries({ ...params, selected_user: user.userId, continue: '1' })
+    .map(([name, value]) => `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}" />`)
+    .join('\n        ');
+  return renderHostedUiPage(`
+      <p>Change Password</p>
+      <p>Please enter a new password for ${escapeHtml(user.email)}.</p>${error ? renderSignInError(error) : ''}
+      <form method="post" action="/oauth2/authorize">
+        ${hidden}
+        <div class="actions">
+          <input type="password" name="new_password" autocomplete="new-password" data-testid="local-auth-new-password" />
+          <button type="submit" data-testid="local-auth-new-password-submit"><span class="btn-name">Send</span></button>
+        </div>
+      </form>`);
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +608,9 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
   const tokenTtlSeconds = options.tokenTtlSeconds ?? 3600;
   const defaultScope = options.defaultScope ?? COGNITO_EMULATOR_DEFAULT_SCOPE;
   const seedUsers = options.users ?? [];
+  // Checked at start-up: a policy real Cognito would refuse fails here, not
+  // on the first password write.
+  const passwordPolicy = resolvePasswordPolicy(options.passwordPolicy);
 
   /** The one user directory. Admin calls and token minting both read it. */
   const users: MutableUser[] = seedUsers.map(fromSeed);
@@ -445,6 +622,15 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
    * only the newest code works.
    */
   const forgotPasswordCodesByUserId = new Map<string, ForgotPasswordCodeRecord>();
+  /** Outstanding NEW_PASSWORD_REQUIRED challenges, keyed by `Session`. Single use. */
+  const newPasswordChallenges = new Map<string, NewPasswordChallengeRecord>();
+  /** The last invitation AdminCreateUser sent each user, keyed by user id. */
+  const invitationsByUserId = new Map<string, CognitoInvitation>();
+  /**
+   * Sign-in sessions (`origin_jti`) whose access tokens Cognito no longer
+   * accepts, after AdminDisableUser or AdminUserGlobalSignOut.
+   */
+  const revokedSessionIds = new Set<string>();
 
   const rsaKeyPair = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const privateKey = createPrivateKey(rsaKeyPair.privateKey.export({ format: 'pem', type: 'pkcs8' }));
@@ -572,6 +758,11 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
       return undefined;
     }
 
+    if (claims.origin_jti && revokedSessionIds.has(claims.origin_jti)) {
+      res.status(400).json({ __type: 'NotAuthorizedException', message: 'Access Token has been revoked' });
+      return undefined;
+    }
+
     const grantedScopes = String(claims.scope ?? '').split(/\s+/).filter(Boolean);
     if (!grantedScopes.includes(COGNITO_SELF_SERVICE_SCOPE)) {
       res.status(400).json({
@@ -590,8 +781,77 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
     // A code left over from a previous test would let the next one confirm a
     // reset it never requested.
     forgotPasswordCodesByUserId.clear();
+    newPasswordChallenges.clear();
+    invitationsByUserId.clear();
+    revokedSessionIds.clear();
     users.length = 0;
     users.push(...seedUsers.map(fromSeed));
+  }
+
+  /**
+   * Revokes every sign-in session the user holds: the refresh tokens stop
+   * refreshing and the access tokens stop authorising Cognito API calls, as
+   * AdminDisableUser and AdminUserGlobalSignOut do in Cognito. A JWT verifier
+   * in the app still accepts an access token until it expires, as with real
+   * Cognito.
+   */
+  function revokeSessions(user: MutableUser): void {
+    for (const [value, record] of refreshTokensByValue) {
+      if (record.userId !== user.userId) continue;
+      revokedSessionIds.add(record.sessionId);
+      refreshTokensByValue.delete(value);
+    }
+  }
+
+  function passwordIssue(password: string): string | null {
+    return validateCognitoPasswordPolicy(password, passwordPolicy);
+  }
+
+  /**
+   * Issues tokens plus a refresh token for a sign-in that did not pass through
+   * /oauth2/authorize, so no caller states a scope. Real Cognito grants
+   * `aws.cognito.signin.user.admin` on these flows.
+   */
+  function issueSignInResult(user: MutableUser, issuer: string) {
+    const sessionId = randomUUID();
+    const scope = defaultScope;
+    const { idToken, accessToken } = issueTokens(user, scope, clientId, sessionId, issuer);
+    const refreshToken = createRandomValue(32);
+    refreshTokensByValue.set(refreshToken, { userId: user.userId, clientId, scope, sessionId, issuer });
+    return {
+      AuthenticationResult: {
+        AccessToken: accessToken,
+        IdToken: idToken,
+        RefreshToken: refreshToken,
+        ExpiresIn: tokenTtlSeconds,
+        TokenType: 'Bearer',
+      },
+      ChallengeParameters: {},
+    };
+  }
+
+  /** Stores the name parts, `email_verified` and custom attributes in `attrs`. */
+  function applyAttributes(user: MutableUser, attrs: Array<{ Name?: string; Value?: string }>): void {
+    const givenAttr = attrs.find((a) => a.Name === 'given_name');
+    const familyAttr = attrs.find((a) => a.Name === 'family_name');
+    if (givenAttr || familyAttr) {
+      const [currentGiven = '', ...currentFamily] = user.name.trim().split(/\s+/).filter(Boolean);
+      const givenName = givenAttr?.Value?.trim() ?? currentGiven;
+      const familyName = familyAttr?.Value?.trim() ?? currentFamily.join(' ');
+      user.name = [givenName, familyName].filter(Boolean).join(' ');
+    }
+    const emailVerifiedAttr = attrs.find((a) => a.Name === 'email_verified')?.Value?.trim();
+    if (emailVerifiedAttr !== undefined) {
+      user.emailVerified = emailVerifiedAttr === 'true';
+    }
+    Object.assign(user.customAttributes, customAttributesFrom(attrs));
+  }
+
+  /** Sets a password the user chose, which ends FORCE_CHANGE_PASSWORD. */
+  function setPermanentPassword(user: MutableUser, password: string): void {
+    user.password = password;
+    user.forceChangePassword = false;
+    touch(user);
   }
 
   function findByEmailQuery(req: express.Request): MutableUser | undefined {
@@ -622,14 +882,19 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
 
   // ---- Hosted UI --------------------------------------------------------------
 
-  app.get('/oauth2/authorize', (req, res) => {
-    const responseType = String(req.query.response_type ?? '').trim();
-    const requestClientId = String(req.query.client_id ?? '').trim();
-    const redirectUri = String(req.query.redirect_uri ?? '').trim() || (options.defaultRedirectUri ?? '');
-    const state = String(req.query.state ?? '').trim();
-    const scope = String(req.query.scope ?? defaultScope).trim();
-    const codeChallenge = String(req.query.code_challenge ?? '').trim();
-    const codeChallengeMethod = String(req.query.code_challenge_method ?? '').trim();
+  /**
+   * The hosted-UI sign-in. GET shows the user picker and takes the pick; POST
+   * carries the new password a FORCE_CHANGE_PASSWORD user chooses. Both read
+   * the same parameters, from the query string or the form body.
+   */
+  function handleAuthorize(input: Record<string, unknown>, req: express.Request, res: ExpressResponse): void {
+    const responseType = String(input.response_type ?? '').trim();
+    const requestClientId = String(input.client_id ?? '').trim();
+    const redirectUri = String(input.redirect_uri ?? '').trim() || (options.defaultRedirectUri ?? '');
+    const state = String(input.state ?? '').trim();
+    const scope = String(input.scope ?? defaultScope).trim();
+    const codeChallenge = String(input.code_challenge ?? '').trim();
+    const codeChallengeMethod = String(input.code_challenge_method ?? '').trim();
 
     if (responseType !== 'code') {
       res.redirect(302, `/error?error=invalid_request&error_description=${encodeURIComponent('response_type must be code')}`);
@@ -652,23 +917,49 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
       return;
     }
 
-    if (String(req.query.continue ?? '').trim() !== '1') {
-      res.status(200).type('html').send(renderAuthorizePage({
-        response_type: responseType,
-        client_id: requestClientId,
-        redirect_uri: redirectUri,
-        state,
-        scope,
-        code_challenge: codeChallenge,
-        code_challenge_method: codeChallengeMethod,
-      }, users));
+    const pageParams = {
+      response_type: responseType,
+      client_id: requestClientId,
+      redirect_uri: redirectUri,
+      state,
+      scope,
+      code_challenge: codeChallenge,
+      code_challenge_method: codeChallengeMethod,
+    };
+
+    if (String(input.continue ?? '').trim() !== '1') {
+      res.status(200).type('html').send(renderAuthorizePage(pageParams, users));
       return;
     }
 
-    const selectedUser = resolveUserSelection(String(req.query.selected_user ?? ''));
+    const selectedUser = resolveUserSelection(String(input.selected_user ?? ''));
     if (!selectedUser) {
       res.status(400).json({ error: 'invalid_request', error_description: 'The emulator has no users to sign in as.' });
       return;
+    }
+
+    // Cognito's hosted UI refuses a disabled user on its sign-in page with the
+    // same words InitiateAuth uses. No code is issued.
+    if (!selectedUser.enabled) {
+      res.status(400).type('html').send(renderHostedUiPage(renderSignInError('User is disabled.')));
+      return;
+    }
+
+    // An invited user, or one given a temporary password, must choose a new
+    // password before Cognito issues a code. The picker stands in for the
+    // temporary-password step; the new password is checked against the policy.
+    if (selectedUser.forceChangePassword) {
+      if (req.method !== 'POST') {
+        res.status(200).type('html').send(renderNewPasswordPage(pageParams, selectedUser));
+        return;
+      }
+      const newPassword = String(input.new_password ?? '');
+      const issue = passwordIssue(newPassword);
+      if (issue) {
+        res.status(400).type('html').send(renderNewPasswordPage(pageParams, selectedUser, `Password does not conform to policy: ${issue}`));
+        return;
+      }
+      setPermanentPassword(selectedUser, newPassword);
     }
 
     const authorizationCode = createRandomValue(24);
@@ -687,7 +978,10 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
     redirectUrl.searchParams.set('code', authorizationCode);
     redirectUrl.searchParams.set('state', state);
     res.redirect(302, redirectUrl.toString());
-  });
+  }
+
+  app.get('/oauth2/authorize', (req, res) => handleAuthorize(req.query as Record<string, unknown>, req, res));
+  app.post('/oauth2/authorize', (req, res) => handleAuthorize((req.body ?? {}) as Record<string, unknown>, req, res));
 
   app.post('/oauth2/token', (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
@@ -757,6 +1051,10 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
     const user = findById(authRecord.userId);
     if (!user) {
       res.status(400).json({ error: 'invalid_grant', error_description: 'the user this code was issued for no longer exists' });
+      return;
+    }
+    if (!user.enabled) {
+      res.status(400).json({ error: 'invalid_grant', error_description: 'User is disabled.' });
       return;
     }
 
@@ -843,6 +1141,16 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
   });
 
   /**
+   * The invitation AdminCreateUser sent, or null. Real Cognito emails the
+   * temporary password; a test reads the one the product caused to be sent,
+   * so the first sign-in runs with the real value.
+   */
+  app.get('/__local/invitation', (req, res) => {
+    const user = findByEmailQuery(req);
+    res.json({ invitation: (user && invitationsByUserId.get(user.userId)) ?? null });
+  });
+
+  /**
    * The reset code `ForgotPassword` just issued, or null. Real Cognito emails
    * it; a test reads the code the product actually caused to be issued, so the
    * confirm step runs with the real value rather than a fixture.
@@ -906,26 +1214,38 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
           return;
         }
 
-        const sessionId = randomUUID();
-        // USER_PASSWORD_AUTH does not pass through /oauth2/authorize, so no
-        // caller states a scope. Real Cognito grants
-        // `aws.cognito.signin.user.admin` on this flow.
-        const scope = defaultScope;
-        const issuer = issuerFor(req);
-        const { idToken, accessToken } = issueTokens(user, scope, clientId, sessionId, issuer);
-        const refreshToken = createRandomValue(32);
-        refreshTokensByValue.set(refreshToken, { userId: user.userId, clientId, scope, sessionId, issuer });
+        // Judged after the password, so a wrong password for a disabled
+        // account reads as a wrong password and says nothing about the state.
+        if (!user.enabled) {
+          res.status(400).json({ __type: 'NotAuthorizedException', message: 'User is disabled.' });
+          return;
+        }
 
-        res.json({
-          AuthenticationResult: {
-            AccessToken: accessToken,
-            IdToken: idToken,
-            RefreshToken: refreshToken,
-            ExpiresIn: tokenTtlSeconds,
-            TokenType: 'Bearer',
-          },
-          ChallengeParameters: {},
-        });
+        // A temporary password signs in only far enough to choose a new one:
+        // Cognito answers with the challenge and issues no tokens.
+        if (user.forceChangePassword) {
+          const session = createRandomValue(48);
+          newPasswordChallenges.set(session, {
+            userId: user.userId,
+            issuer: issuerFor(req),
+            expiresAtMs: Date.now() + CHALLENGE_SESSION_TTL_MS,
+          });
+          const userAttributes = Object.fromEntries(
+            toCognitoUserAttributes(user).filter((a) => a.Name !== 'sub').map((a) => [a.Name, a.Value]),
+          );
+          res.json({
+            ChallengeName: 'NEW_PASSWORD_REQUIRED',
+            Session: session,
+            ChallengeParameters: {
+              USER_ID_FOR_SRP: user.userId,
+              requiredAttributes: '[]',
+              userAttributes: JSON.stringify(userAttributes),
+            },
+          });
+          return;
+        }
+
+        res.json(issueSignInResult(user, issuerFor(req)));
         return;
       }
 
@@ -942,6 +1262,10 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
           // A deleted user's refresh token is dropped too.
           refreshTokensByValue.delete(refreshToken);
           res.status(400).json({ __type: 'NotAuthorizedException', message: 'Refresh Token has expired' });
+          return;
+        }
+        if (!user.enabled) {
+          res.status(400).json({ __type: 'NotAuthorizedException', message: 'User is disabled.' });
           return;
         }
 
@@ -965,6 +1289,83 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
       });
     },
 
+    RespondToAuthChallenge(payload, _req, res) {
+      if (String(payload.ClientId ?? '').trim() !== clientId) {
+        res.status(400).json({ __type: 'NotAuthorizedException', message: 'Invalid client id.' });
+        return;
+      }
+
+      const challengeName = String(payload.ChallengeName ?? '').trim();
+      if (challengeName !== 'NEW_PASSWORD_REQUIRED') {
+        res.status(400).json({
+          __type: 'InvalidParameterException',
+          message: `Challenge ${challengeName} is not supported by the local emulator.`,
+        });
+        return;
+      }
+
+      const session = String(payload.Session ?? '');
+      const record = newPasswordChallenges.get(session);
+      const user = record ? findById(record.userId) : undefined;
+      if (!record || !user) {
+        res.status(400).json({ __type: 'NotAuthorizedException', message: 'Invalid session for the user.' });
+        return;
+      }
+      if (record.expiresAtMs <= Date.now()) {
+        newPasswordChallenges.delete(session);
+        res.status(400).json({ __type: 'NotAuthorizedException', message: 'Invalid session for the user, session is expired.' });
+        return;
+      }
+
+      const responses = (payload.ChallengeResponses ?? {}) as Record<string, unknown>;
+      const username = String(responses.USERNAME ?? '').trim();
+      const newPassword = String(responses.NEW_PASSWORD ?? '');
+      if (!username || !newPassword) {
+        res.status(400).json({
+          __type: 'InvalidParameterException',
+          message: `Missing required parameter ${username ? 'NEW_PASSWORD' : 'USERNAME'}`,
+        });
+        return;
+      }
+      if (findByLogin(username) !== user) {
+        res.status(400).json({ __type: 'NotAuthorizedException', message: 'Invalid session for the user.' });
+        return;
+      }
+
+      // `userAttributes.<name>` sets an attribute alongside the new password.
+      // The emulator stores names and custom attributes only; anything else is
+      // refused by name rather than dropped.
+      const attributes: Array<{ Name: string; Value: string }> = [];
+      for (const [key, value] of Object.entries(responses)) {
+        if (key === 'USERNAME' || key === 'NEW_PASSWORD') continue;
+        const attributeName = key.startsWith('userAttributes.') ? key.slice('userAttributes.'.length) : undefined;
+        if (!attributeName || !(attributeName === 'given_name' || attributeName === 'family_name' || attributeName.startsWith('custom:'))) {
+          res.status(400).json({
+            __type: 'InvalidParameterException',
+            message: `The local emulator does not support the challenge response ${attributeName ?? key}.`,
+          });
+          return;
+        }
+        attributes.push({ Name: attributeName, Value: String(value) });
+      }
+
+      const issue = passwordIssue(newPassword);
+      if (issue) {
+        passwordPolicyRefusal(res, issue);
+        return;
+      }
+
+      if (!user.enabled) {
+        res.status(400).json({ __type: 'NotAuthorizedException', message: 'User is disabled.' });
+        return;
+      }
+
+      newPasswordChallenges.delete(session);
+      applyAttributes(user, attributes);
+      setPermanentPassword(user, newPassword);
+      res.json(issueSignInResult(user, record.issuer));
+    },
+
     ListUsers(payload, _req, res) {
       // Real Cognito only accepts a Filter on a fixed set of standard
       // attributes; a filter on a custom attribute is rejected with
@@ -985,39 +1386,69 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
         }
       }
 
-      // ListUsers returns attributes in `Attributes`; AdminGetUser uses
-      // `UserAttributes`.
-      let listed = users.map((user) => {
-        const createdAtEpoch = toEpochSeconds(user.createdAt);
-        return {
-          Username: user.userId,
-          Attributes: toCognitoUserAttributes(user),
-          Enabled: true,
-          UserStatus: userStatus(user),
-          UserCreateDate: createdAtEpoch,
-          UserLastModifiedDate: createdAtEpoch,
-        };
-      });
+      // Limit is 0..60, and an absent Limit means a page of 60.
+      const limit = payload.Limit ?? LIST_USERS_MAX_LIMIT;
+      if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 0 || limit > LIST_USERS_MAX_LIMIT) {
+        res.status(400).json({
+          __type: 'InvalidParameterException',
+          message: `1 validation error detected: Value '${String(limit)}' at 'limit' failed to satisfy constraint: Member must have value less than or equal to ${LIST_USERS_MAX_LIMIT}`,
+        });
+        return;
+      }
+      const pageSize = limit === 0 ? LIST_USERS_MAX_LIMIT : limit;
+
+      const attributesToGet = payload.AttributesToGet;
+      if (attributesToGet !== undefined && (!Array.isArray(attributesToGet) || attributesToGet.some((a) => typeof a !== 'string'))) {
+        res.status(400).json({ __type: 'InvalidParameterException', message: 'AttributesToGet must be a list of attribute names.' });
+        return;
+      }
+
+      // The token names where the next page starts and the Filter it belongs
+      // to: a token presented with a different Filter is refused rather than
+      // continuing someone else's query.
+      let offset = 0;
+      if (payload.PaginationToken !== undefined) {
+        const token = decodeListUsersToken(String(payload.PaginationToken));
+        if (!token || token.filter !== rawFilter) {
+          res.status(400).json({ __type: 'InvalidParameterException', message: 'Invalid pagination token.' });
+          return;
+        }
+        offset = token.offset;
+      }
 
       // APPLY the filter. Validating it and then returning every user would
       // make a lookup by email match the first user in the pool locally and
       // the right one in production.
+      let matched = users;
       if (filterAttribute) {
-        const needle = filterValue.toLowerCase();
-        listed = listed.filter((user) => {
-          const attributeValue = filterAttribute === 'username'
-            ? user.Username
-            : filterAttribute === 'cognito:user_status' || filterAttribute === 'status'
-              ? user.UserStatus
-              : user.Attributes.find((a) => a.Name === filterAttribute)?.Value;
+        matched = users.filter((user) => {
+          // `username` and `status` compare case-sensitively in Cognito; the
+          // other attributes do not.
+          if (filterAttribute === 'username' || filterAttribute === 'status') {
+            const exact = filterAttribute === 'username' ? user.userId : user.enabled ? 'Enabled' : 'Disabled';
+            return filterIsPrefix ? exact.startsWith(filterValue) : exact === filterValue;
+          }
+          const attributeValue = filterAttribute === 'cognito:user_status'
+            ? userStatus(user)
+            : toCognitoUserAttributes(user).find((a) => a.Name === filterAttribute)?.Value;
           if (attributeValue === undefined) return false;
           const haystack = attributeValue.toLowerCase();
+          const needle = filterValue.toLowerCase();
           return filterIsPrefix ? haystack.startsWith(needle) : haystack === needle;
         });
       }
 
-      const limit = typeof payload.Limit === 'number' ? payload.Limit : undefined;
-      res.json({ Users: limit === undefined ? listed : listed.slice(0, limit) });
+      const page = matched.slice(offset, offset + pageSize).map((user) => {
+        const listed = toUserType(user);
+        return attributesToGet === undefined
+          ? listed
+          : { ...listed, Attributes: listed.Attributes.filter((a) => (attributesToGet as string[]).includes(a.Name)) };
+      });
+      const nextOffset = offset + pageSize;
+      res.json({
+        Users: page,
+        ...(nextOffset < matched.length ? { PaginationToken: encodeListUsersToken({ offset: nextOffset, filter: rawFilter }) } : {}),
+      });
     },
 
     AdminGetUser(payload, _req, res) {
@@ -1026,17 +1457,10 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
         userNotFound(res);
         return;
       }
-      const createdAtEpoch = toEpochSeconds(user.createdAt);
-      res.json({
-        Username: user.userId,
-        UserAttributes: toCognitoUserAttributes(user),
-        UserCreateDate: createdAtEpoch,
-        UserLastModifiedDate: createdAtEpoch,
-        Enabled: true,
-        // An invited account that has never set a password is
-        // FORCE_CHANGE_PASSWORD, exactly as Cognito reports it.
-        UserStatus: userStatus(user),
-      });
+      // AdminGetUser names the attribute list `UserAttributes`; ListUsers and
+      // AdminCreateUser name it `Attributes`.
+      const { Attributes, ...rest } = toUserType(user);
+      res.json({ ...rest, UserAttributes: Attributes });
     },
 
     AdminListGroupsForUser(payload, _req, res) {
@@ -1074,17 +1498,41 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
 
     AdminUserGlobalSignOut(payload, _req, res) {
       // Cognito groups ride in the JWT, so an app that changes a user's groups
-      // signs the user out to force a fresh token. Drops the user's refresh
-      // tokens; access tokens already issued stay valid until they expire, as
-      // in Cognito.
+      // signs the user out to force a fresh token. Revokes the user's refresh
+      // tokens, and their access tokens for Cognito API calls such as GetUser.
+      // An app's own JWT verifier still accepts an access token until it
+      // expires, as with Cognito.
       const user = findByLogin(String(payload.Username ?? ''));
       if (!user) {
         userNotFound(res, 'User not found.');
         return;
       }
-      for (const [value, record] of refreshTokensByValue) {
-        if (record.userId === user.userId) refreshTokensByValue.delete(value);
+      revokeSessions(user);
+      res.json({});
+    },
+
+    AdminDisableUser(payload, _req, res) {
+      const user = findByLogin(String(payload.Username ?? ''));
+      if (!user) {
+        userNotFound(res);
+        return;
       }
+      // Cognito "deactivates a user profile and revokes all access tokens for
+      // the user". Re-enabling does not bring the revoked sessions back.
+      user.enabled = false;
+      revokeSessions(user);
+      touch(user);
+      res.json({});
+    },
+
+    AdminEnableUser(payload, _req, res) {
+      const user = findByLogin(String(payload.Username ?? ''));
+      if (!user) {
+        userNotFound(res);
+        return;
+      }
+      user.enabled = true;
+      touch(user);
       res.json({});
     },
 
@@ -1092,6 +1540,82 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
       const username = String(payload.Username ?? '').trim();
       const tempPasswordRaw = String(payload.TemporaryPassword ?? '').trim();
       const userAttrs = readAttributes(payload.UserAttributes);
+
+      const messageAction = payload.MessageAction === undefined ? undefined : String(payload.MessageAction);
+      if (messageAction !== undefined && messageAction !== 'RESEND' && messageAction !== 'SUPPRESS') {
+        res.status(400).json({
+          __type: 'InvalidParameterException',
+          message: `1 validation error detected: Value '${messageAction}' at 'messageAction' failed to satisfy constraint: Member must satisfy enum value set: [RESEND, SUPPRESS]`,
+        });
+        return;
+      }
+
+      // Cognito's default is SMS.
+      const rawMediums: unknown = payload.DesiredDeliveryMediums ?? ['SMS'];
+      if (!Array.isArray(rawMediums) || rawMediums.some((m) => !DELIVERY_MEDIUMS.has(String(m)))) {
+        res.status(400).json({
+          __type: 'InvalidParameterException',
+          message: `1 validation error detected: Value '${JSON.stringify(rawMediums)}' at 'desiredDeliveryMediums' failed to satisfy constraint: Member must satisfy enum value set: [SMS, EMAIL]`,
+        });
+        return;
+      }
+      const deliveryMediums = rawMediums.map(String);
+
+      if (tempPasswordRaw) {
+        const issue = passwordIssue(tempPasswordRaw);
+        if (issue) {
+          passwordPolicyRefusal(res, issue);
+          return;
+        }
+      }
+
+      /**
+       * The emulator stores no phone number, so it cannot say what Cognito
+       * does with an SMS invitation. It refuses rather than guess.
+       */
+      const refuseSmsInvitation = (): boolean => {
+        if (messageAction === 'SUPPRESS' || !deliveryMediums.includes('SMS')) return false;
+        res.status(400).json({
+          __type: 'InvalidParameterException',
+          message: 'The local emulator cannot deliver an invitation by SMS (DesiredDeliveryMediums defaults to SMS). '
+            + 'Send DesiredDeliveryMediums: ["EMAIL"], or MessageAction: "SUPPRESS".',
+        });
+        return true;
+      };
+
+      const sendInvitation = (user: MutableUser): void => {
+        if (messageAction === 'SUPPRESS') return;
+        invitationsByUserId.set(user.userId, {
+          userId: user.userId,
+          email: user.email,
+          temporaryPassword: user.password,
+          deliveryMediums,
+          sentAt: new Date().toISOString(),
+        });
+      };
+
+      // RESEND: a new temporary password for a user who has not yet set one.
+      if (messageAction === 'RESEND') {
+        const existing = findByLogin(username);
+        if (!existing) {
+          userNotFound(res);
+          return;
+        }
+        if (!existing.forceChangePassword) {
+          res.status(400).json({
+            __type: 'UnsupportedUserStateException',
+            message: `Resend not possible. ${username} status is not FORCE_CHANGE_PASSWORD.`,
+          });
+          return;
+        }
+        if (refuseSmsInvitation()) return;
+        existing.password = tempPasswordRaw || generateTemporaryPassword(passwordPolicy);
+        touch(existing);
+        sendInvitation(existing);
+        res.json({ User: toUserType(existing) });
+        return;
+      }
+
       const email = (userAttrs.find((a) => a.Name === 'email')?.Value ?? username).trim();
       const givenName = userAttrs.find((a) => a.Name === 'given_name')?.Value?.trim() ?? '';
       const familyName = userAttrs.find((a) => a.Name === 'family_name')?.Value?.trim() ?? '';
@@ -1104,48 +1628,39 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
         return;
       }
 
-      if (tempPasswordRaw) {
-        const passwordIssue = validateCognitoDefaultPasswordPolicy(tempPasswordRaw);
-        if (passwordIssue) {
-          passwordPolicyRefusal(res, passwordIssue);
-          return;
-        }
-      }
-
       if (users.some((u) => u.email.toLowerCase() === email.toLowerCase())) {
         res.status(400).json({ __type: 'UsernameExistsException', message: 'User already exists.' });
         return;
       }
 
+      if (refuseSmsInvitation()) return;
+
       // Honour whatever `email_verified` was sent rather than defaulting to
       // verified, so the emulator cannot quietly make a suite greener than
       // production.
       const emailVerifiedAttr = userAttrs.find((a) => a.Name === 'email_verified')?.Value?.trim();
+      const createdAt = new Date().toISOString();
       const newUser: MutableUser = {
         userId: randomUUID(),
         email,
         name: displayName,
         groups: [...(options.newUserGroups ?? [])],
-        password: tempPasswordRaw || COGNITO_EMULATOR_DEFAULT_PASSWORD,
+        // With no TemporaryPassword, Cognito generates one and sends it in the
+        // invitation. With SUPPRESS as well, nobody learns it: the account
+        // signs in only after AdminSetUserPassword.
+        password: tempPasswordRaw || generateTemporaryPassword(passwordPolicy),
         emailVerified: emailVerifiedAttr === undefined ? true : emailVerifiedAttr === 'true',
         forceChangePassword: true,
+        enabled: true,
         customAttributes: customAttributesFrom(userAttrs),
         softwareTokenMfaEnabled: false,
-        createdAt: new Date().toISOString(),
+        createdAt,
+        lastModifiedAt: createdAt,
       };
       users.push(newUser);
+      sendInvitation(newUser);
 
-      const createdAtEpoch = toEpochSeconds(newUser.createdAt);
-      res.json({
-        User: {
-          Username: newUser.userId,
-          Attributes: toCognitoUserAttributes(newUser),
-          Enabled: true,
-          UserStatus: userStatus(newUser),
-          UserCreateDate: createdAtEpoch,
-          UserLastModifiedDate: createdAtEpoch,
-        },
-      });
+      res.json({ User: toUserType(newUser) });
     },
 
     AdminUpdateUserAttributes(payload, _req, res) {
@@ -1154,20 +1669,8 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
         userNotFound(res);
         return;
       }
-      const userAttrs = readAttributes(payload.UserAttributes);
-      const givenAttr = userAttrs.find((a) => a.Name === 'given_name');
-      const familyAttr = userAttrs.find((a) => a.Name === 'family_name');
-      if (givenAttr || familyAttr) {
-        const [currentGiven = '', ...currentFamily] = user.name.trim().split(/\s+/).filter(Boolean);
-        const givenName = givenAttr?.Value?.trim() ?? currentGiven;
-        const familyName = familyAttr?.Value?.trim() ?? currentFamily.join(' ');
-        user.name = [givenName, familyName].filter(Boolean).join(' ');
-      }
-      const emailVerifiedAttr = userAttrs.find((a) => a.Name === 'email_verified')?.Value?.trim();
-      if (emailVerifiedAttr !== undefined) {
-        user.emailVerified = emailVerifiedAttr === 'true';
-      }
-      Object.assign(user.customAttributes, customAttributesFrom(userAttrs));
+      applyAttributes(user, readAttributes(payload.UserAttributes));
+      touch(user);
       res.json({});
     },
 
@@ -1178,16 +1681,20 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
         userNotFound(res, 'User not found.');
         return;
       }
-      const passwordIssue = validateCognitoDefaultPasswordPolicy(password);
-      if (passwordIssue) {
-        passwordPolicyRefusal(res, passwordIssue);
+      const issue = passwordIssue(password);
+      if (issue) {
+        passwordPolicyRefusal(res, issue);
         return;
       }
-      user.password = password;
-      // A permanent password moves the account from FORCE_CHANGE_PASSWORD to
-      // CONFIRMED. A temporary one leaves it where it is.
+      // A permanent password moves the account to CONFIRMED. A temporary one
+      // (Permanent false or absent) moves it to FORCE_CHANGE_PASSWORD, even
+      // from CONFIRMED, so the next sign-in meets NEW_PASSWORD_REQUIRED.
       if (payload.Permanent === true) {
-        user.forceChangePassword = false;
+        setPermanentPassword(user, password);
+      } else {
+        user.password = password;
+        user.forceChangePassword = true;
+        touch(user);
       }
       res.json({});
     },
@@ -1203,6 +1710,7 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
         if (record.userId === user.userId) refreshTokensByValue.delete(value);
       }
       forgotPasswordCodesByUserId.delete(user.userId);
+      invitationsByUserId.delete(user.userId);
       res.json({});
     },
 
@@ -1285,13 +1793,14 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
       // Checked AFTER the code, as Cognito does. Checking it first would let a
       // caller with no code learn the policy.
       const password = String(payload.Password ?? '');
-      const passwordIssue = validateCognitoDefaultPasswordPolicy(password);
-      if (passwordIssue) {
-        passwordPolicyRefusal(res, passwordIssue);
+      const issue = passwordIssue(password);
+      if (issue) {
+        passwordPolicyRefusal(res, issue);
         return;
       }
 
       user.password = password;
+      touch(user);
       forgotPasswordCodesByUserId.delete(user.userId);
       // Cognito revokes every refresh token on a password reset. Without this
       // a session opened with the OLD password keeps refreshing.
@@ -1385,6 +1894,10 @@ export function createCognitoEmulator(options: CognitoEmulatorOptions = {}): Cog
     getUser: (userIdOrEmail) => {
       const user = findByLogin(userIdOrEmail);
       return user ? toRecord(user) : null;
+    },
+    getInvitation: (userIdOrEmail) => {
+      const user = findByLogin(userIdOrEmail);
+      return (user && invitationsByUserId.get(user.userId)) ?? null;
     },
     reset,
   };
